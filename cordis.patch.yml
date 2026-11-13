@@ -1,4 +1,4 @@
-﻿# 酒馆角色扮演 Agent 预设（bundle 补丁层）
+# 酒馆角色扮演 Agent 预设（bundle 补丁层）
 #
 # 用途：酒馆（SillyTavern）通过中转层把每轮生成的完整提示词交给 dsh 处理，
 #      dsh 以纯文本角色扮演写作者的身份输出正文（可含分段标记）。
@@ -150,8 +150,25 @@
           # persona 里已把 skill("humanize-prose") 设为硬性前置动作。
           # 早期版本这里写的是「按需调用；不强制」，实测命中率只有约 2/3 ——
           # 模型在长提示词 + 长技能清单下经常直接动笔，退回 AI 腔。
+          #
+          # 技能可见范围**收紧到工作区这一份**，理由是上下文噪音：
+          # skill-filesystem 默认 includeDefaultRoots: true，会连
+          # <dshHome>/skills 一起扫，把全局那十几个工具类技能（下载器、剪映、
+          # Office、解密、GitHub 抓取…）整段塞进 skill-catalog，钉在「工具代理」
+          # 语境上，对写小说毫无用处还吃 token。
+          #
+          # 坑：includeDefaultRoots 一个开关同时管「工作区 .dsh/skills」和
+          # 「<dshHome>/skills」两层（见 dsh-skill-filesystem 的 roots()），
+          # 所以关掉之后必须用 customSkillDirs 把工作区那份显式加回来。
+          #
+          # 代价：这里写的是绝对路径。若把插件的 workspace 配置改到别处，
+          # 记得同步改下面这一行，否则技能会整个消失（模型仍能写，只是没有技能）。
           - id: skill-filesystem
             name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              includeDefaultRoots: false
+              customSkillDirs:
+                - 'C:/Users/Administrator/Desktop/DSH酒馆/.dsh/skills'
 
           - id: tool-skill
             name: '@deepseek-ai/dsh-tool-skill'
@@ -160,6 +177,13 @@
           # 索引式技能（如 humanize-prose）把详细内容拆在 references/ 下，
           # 模型必须能读文件才能「按需加载」而不是每次全文塞进上下文。
           #
+          # 只开 read 一个。tool-fs 默认把 read / readImage / write / edit
+          # 全开，但酒馆会话只需要 read：
+          #   write / edit  —— 本会话是 read-only，写了也会被沙箱拒，纯占 schema
+          #                    （这两个加起来 2 KB，是剩下 5 个工具里最大的两块）
+          #   readImage     —— 酒馆发来的都是纯文本，没有图片可看
+          # 关掉后工具 schema 从 3.1 KB 降到约 0.8 KB。
+          #
           # 安全性：本会话的 permissionPreset 必须是 read-only。
           # dsh 的沙箱对 read-only store 一律拒绝写入（源码注释：
           # "read-only stores still refuse writes"），因此即便挂了
@@ -167,6 +191,75 @@
           # 不挂 shell / 不挂网络 / 不挂 subagent，仍无副作用。
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: false
+              write: false
+              edit: false
+              applyPatch: false
+
+# ══════════════════════════════════════════════════════════════════
+# 酒馆「素材路由」预设（两阶段流程的阶段 1）
+#
+# 用途：只做技能文件的按需加载，不写正文。
+#   引擎为 direct 时，一轮请求分两步：
+#     阶段 1（本预设）：把最近几轮对话交给这个 agent，让它调 skill 判断该读
+#                      哪几份 references，并用 read 读出来。插件只从
+#                      tool/call 里收集路径，内容自己按路径读全文（tool/result
+#                      带 <path>/<content> 包装和行号，而且 agent 会分段读，
+#                      直接拼会得到残片）。
+#     阶段 2（不走 dsh）：把酒馆原始 messages + 这些文件拼成 system，直连
+#                      ctx.llm.stream() 生成，上下文里没有任何 agent 痕迹。
+#
+# 人设刻意极简：它不需要文笔、不需要角色设定，只需要「判断 + 读文件」。
+# agent-instructions 不挂（不读 AGENTS.md），减少一切无关噪音。
+# ══════════════════════════════════════════════════════════════════
+    - id: preset-tavern-prep
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: tavern-prep
+        name: 酒馆素材路由
+        description: 只负责判断并读取写作参考文件，不产出任何正文。
+        order: 4
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                你是素材路由器，不写任何正文。
+
+                每次调用你会收到一轮角色扮演对话的最近片段。你的唯一任务，
+                是判断这一轮需要哪几份写作参考文件，然后把它们读出来。
+
+                步骤：
+                1. 调用 skill 工具，name = "humanize-prose"，拿 references 索引。
+                2. 按索引里每份文件的用途说明，判断这一轮用得上哪几份。
+                3. 用 read 工具把它们读完（都在 references/ 目录下）。
+                4. 读完立刻停止。
+
+                判断原则：宁可多读一份 —— 多读只多几秒，漏读会让这一轮正文
+                退回 AI 腔，得整个重写。
+              suffix: >-
+                再强调一次：不要写正文、不要写场景、不要写段落示例。
+                你这一轮的产出只应该是工具调用。读完了就停下。
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              includeDefaultRoots: false
+              customSkillDirs:
+                - 'C:/Users/Administrator/Desktop/DSH酒馆/.dsh/skills'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          # 阶段 1 只用 read 看 references，不写不改不看图 —— 和角色扮演预设一致，
+          # 关掉 write / edit / readImage 省掉约 2.3 KB 的 schema。
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: false
+              write: false
+              edit: false
+              applyPatch: false
 
 # ══════════════════════════════════════════════════════════════════
 # 酒馆中转插件（dsh-tavern-bridge）
@@ -185,6 +278,82 @@
     - id: tavern-bridge
       name: dsh-tavern-bridge
       config:
+        # 引擎：
+        #   direct —— 两阶段（默认）。阶段 1 用 tavern-prep 预设做技能按需加载，
+        #             阶段 2 拿酒馆原始 messages 直连 ctx.llm 生成。
+        #             生成时上下文里没有 persona / runtime-context / skill-catalog。
+        #   agent  —— 旧路径，整段提示词塞进带预设的会话跑完一轮。
+        # 出问题改回 agent 即可回退。
+        engine: direct
+        # ── 路由表：酒馆里换模型名 = 换引擎，不用重启 dsh、不用改地址 ──
+        #
+        # 每一项的 `id` 就是要在酒馆「模型」里填的字符串。命中后下面这些字段
+        # 覆盖同名全局配置，没写的沿用全局值 —— 所以一条路由只写差异即可。
+        #
+        # 支持的字段：engine / preset / preparePreset / provider / model /
+        #             reasoningEffort / prepareReasoningEffort /
+        #             prepareTimeoutMs / prepareMaxChars
+        #
+        # 为什么能这么干：酒馆的 model 字段在整条链路上是纯字符串透传
+        # （前端 generate_data.model → 服务端 requestBody.model → 原样 POST），
+        # 没有白名单拦截。插件读一下 body.model 就能分流。
+        #
+        # 命名避开 `/`：酒馆 CUSTOM 分支对 /^koboldcpp\// 有特判，带斜杠容易误处理。
+        #
+        # routes 留空 = 老行为，全部按上面的 engine 单值走。
+        routes:
+          # A 路由：原教旨按需加载。整段提示词塞进挂好预设的会话，
+          # 模型在 agent loop 里自己调 skill、自己 read、自己决定读几轮。
+          # 工具齐全、最像"真 agent"，代价是上下文里有 persona/工具 schema，
+          # 且正文要多一步「从最后一个工具步骤之后切」才干净。
+          - id: tavern-agent
+            engine: agent
+            preset: tavern-roleplay
+            provider: codebuddy
+            model: deepseek-v4.1-flash
+            reasoningEffort: high
+          # B 路由：打包提示词。阶段 1 用 tavern-prep 一次判完该读哪几份，
+          # 阶段 2 拿酒馆原始 messages + 写作规范 + 素材直连 ctx.llm 生成，
+          # 生成时上下文里没有 persona / runtime-context / skill-catalog / 工具。
+          - id: tavern-direct
+            engine: direct
+            preparePreset: tavern-prep
+            prepareReasoningEffort: low
+            prepareTimeoutMs: 20000
+            prepareMaxChars: 60000
+            provider: codebuddy
+            model: deepseek-v4.1-flash
+            reasoningEffort: high
+        # 模型名一个路由都没命中时走这条。留空 = 用下面的全局单值配置。
+        defaultRoute: tavern-direct
+        preparePreset: tavern-prep
+        # 阶段 1 最多等多久（毫秒）。只做判断+读文件，给短一点。
+        prepareTimeoutMs: 20000
+        # 阶段 1 的思考档位：判断题材不需要 high。
+        prepareReasoningEffort: low
+        # 阶段 1 输入的字符预算。酒馆提示词**完整传入**（题材常藏在角色卡/
+        # 世界书里，只给最近几轮会漏判）；只有超过这个数才压缩对话历史，
+        # 设定材料永远不截。角色卡特别长时调大。
+        prepareMaxChars: 60000
+        # 技能根目录。留空 = <工作区>/.dsh/skills/humanize-prose
+        skillDir: ''
+        # ── 工具裁剪：把与本任务无关的全局工具挡掉 ──
+        #
+        # 为什么要有这一项：dsh 的工具按上下文**继承**，预设只能往里加、
+        # 没法往外减，所以全局挂载的工具会跟着每一轮酒馆请求一起重发。
+        # 实测一轮请求的 tools 是 43 个 / 33 KB / 约 9k tokens，
+        # 其中 32 个是 MCP 工具（26 个 chrome-devtools 的浏览器自动化），
+        # 与写小说毫无关系，纯粹在吃上下文和钱。
+        #
+        # 实现用的是 dsh-tools 的 restrict({ deny })：只能 deny 全局工具。
+        # skill / read 是预设（tool-skill / tool-fs）挂在本 agent scope 上的
+        # 「本地工具」，不受裁剪影响、永远可见 —— 所以下面不需要写它们，
+        # 写了反而会被当成「未知全局工具名」而报错。
+        #
+        # 想放开某个全局工具时，把名字加到 allowTools；
+        # 想彻底关掉裁剪（排查问题时），把 trimTools 设成 false。
+        trimTools: true
+        allowTools: []
         # 监听端口。默认 57421（冷门段）。
         port: 57421
         # portFallback: 端口被占用时自动往后找空闲端口。
@@ -194,11 +363,13 @@
         host: '127.0.0.1'
         # 工作区。留空 = %USERPROFILE%\Desktop\DSH酒馆（不存在会自动创建）。
         workspace: ''
-        # 酒馆请求使用的 agent 预设与模型。
-        agentPreset: tavern-roleplay
-        provider: deepseek-official
-        model: deepseek-flash
+        # 全局兜底模型（只在 routes 未命中、且 defaultRoute 也留空时生效）。
+        # 保持与本机 dsh 的默认模型一致，否则会落到不存在的 provider 上。
+        provider: codebuddy
+        model: deepseek-v4.1-flash
         reasoningEffort: high
+        # agent 路由的兜底预设（路由里没写 preset 时用这条）。
+        agentPreset: tavern-roleplay
         # 访问口令。留空 = 不校验（仅回环访问，安全）。
         # 填了之后酒馆的 API Key 必须填同一个值。
         authToken: ''

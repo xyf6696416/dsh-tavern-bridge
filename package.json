@@ -1,6 +1,6 @@
 {
   "name": "dsh-tavern-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "酒馆（SillyTavern）中转插件：把 OpenAI 兼容请求转给 dsh agent，随 dsh 启停，自带角色扮演预设与 humanize-prose 技能。",
   "type": "module",
